@@ -5,24 +5,20 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles
 
-# =========================================================
-# Weight table: WEIGHTS[post_neuron][pre_neuron]
-# WEIGHTS[n][i] = synaptic strength from neuron i → neuron n
-# Weights are held by RP2040; presented on ui_in[3:0] during ACCUM states
-# =========================================================
+# Weight table: WEIGHTS[post][pre] — 8×8, RP2040 streams these
 WEIGHTS = [
-    [ 0,  0,  0,  0],   # into neuron 0
-    [10,  0,  0,  0],   # into neuron 1: weight 10 from neuron 0
-    [ 0,  0,  0,  0],   # into neuron 2
-    [ 0,  0,  0,  0],   # into neuron 3
+    [ 0,  0,  0,  0,  0,  0,  0,  0],   # into neuron 0
+    [10,  0,  0,  0,  0,  0,  0,  0],   # into neuron 1: weight 10 from neuron 0
+    [ 0,  0,  0,  0,  0,  0,  0,  0],   # into neuron 2
+    [ 0,  0,  0,  0,  0,  0,  0,  0],   # into neuron 3
+    [ 0,  0,  0,  0,  0,  0,  0,  0],   # into neuron 4
+    [ 0,  0,  0,  0,  0,  0,  0,  0],   # into neuron 5
+    [ 0,  0,  0,  0,  0,  0,  0,  0],   # into neuron 6
+    [ 0,  0,  0,  0,  0,  0,  0,  0],   # into neuron 7
 ]
 
-FSM_PERIOD = 28  # 7 states × 4 neurons
+FSM_PERIOD = 88  # 11 states × 8 neurons
 
-
-# =========================================================
-# Helpers
-# =========================================================
 
 async def do_reset(dut):
     dut.rst_n.value  = 0
@@ -36,24 +32,26 @@ async def do_reset(dut):
 
 async def weight_driver(dut, weight_table, ext_spike_mask=0):
     """
-    Background task that mimics the RP2040 PIO weight streaming.
+    Mimics the RP2040 PIO weight streaming.
 
-    Reads neuron_sel and syn_sel from chip outputs after each clock edge,
-    then immediately drives the correct weight on ui_in[3:0] so it is
-    stable before the next rising edge.
+    Samples uio_out on the falling edge (after all NBA settle) to read
+    in_accum, neuron_idx, and syn_idx, then drives ui_in accordingly.
 
-    ui_in[7:4] = ext_spike_mask  (held constant throughout)
-    ui_in[3:0] = weight[neuron][syn] when in_accum=1, else 0
+    During ACCUM:     ui_in[3:0] = weight[neuron][syn], ui_in[7:4] = 0
+    Outside ACCUM:    ui_in[7:0] = ext_spike_mask (latched at S_LATCH/neuron0)
     """
     while True:
-        await FallingEdge(dut.clk)   # sample after NBA propagation, 10ns past rising edge
+        await FallingEdge(dut.clk)
 
-        in_accum = (int(dut.uo_out.value) >> 6) & 0x1
-        neuron_n = (int(dut.uo_out.value) >> 4) & 0x3
-        syn_s    = (int(dut.uio_out.value) >> 5) & 0x3
+        uio_val  = int(dut.uio_out.value)
+        in_accum = (uio_val >> 1) & 0x1   # uio_out[1]
+        neuron_n = (uio_val >> 2) & 0x7   # uio_out[4:2]
+        syn_s    = (uio_val >> 5) & 0x7   # uio_out[7:5]
 
-        w = weight_table[neuron_n][syn_s] if in_accum else 0
-        dut.ui_in.value = ((ext_spike_mask & 0xF) << 4) | (w & 0xF)
+        if in_accum:
+            dut.ui_in.value = weight_table[neuron_n][syn_s] & 0xF
+        else:
+            dut.ui_in.value = ext_spike_mask & 0xFF
 
 
 # =========================================================
@@ -62,19 +60,20 @@ async def weight_driver(dut, weight_table, ext_spike_mask=0):
 
 @cocotb.test()
 async def test_neuron_sel_cycles(dut):
-    """All 4 neurons must appear on neuron_sel within one FSM period."""
-    clock = Clock(dut.clk, 20, units="ns")  # 50 MHz
+    """All 8 neurons must appear on neuron_sel within one FSM period."""
+    clock = Clock(dut.clk, 20, units="ns")
     cocotb.start_soon(clock.start())
     await do_reset(dut)
 
     seen = set()
-    for _ in range(FSM_PERIOD + 4):
+    for _ in range(FSM_PERIOD + 12):
         await RisingEdge(dut.clk)
-        n = (int(dut.uo_out.value) >> 4) & 0x3
+        n = (int(dut.uio_out.value) >> 2) & 0x7   # uio_out[4:2]
         seen.add(n)
 
-    assert seen == {0, 1, 2, 3}, f"Not all neurons seen in neuron_sel: {seen}"
-    dut._log.info("neuron_sel cycles through all 4 neurons OK")
+    assert seen == {0, 1, 2, 3, 4, 5, 6, 7}, \
+        f"Not all neurons seen in neuron_sel: {seen}"
+    dut._log.info("neuron_sel cycles through all 8 neurons OK")
 
 
 # =========================================================
@@ -88,13 +87,13 @@ async def test_ext_spike_injection(dut):
     cocotb.start_soon(clock.start())
     await do_reset(dut)
 
-    zero_weights = [[0] * 4 for _ in range(4)]
-    cocotb.start_soon(weight_driver(dut, zero_weights, ext_spike_mask=0b0001))
+    zero_weights = [[0] * 8 for _ in range(8)]
+    cocotb.start_soon(weight_driver(dut, zero_weights, ext_spike_mask=0b00000001))
 
     spike_seen = False
     for _ in range(FSM_PERIOD * 3):
         await RisingEdge(dut.clk)
-        if int(dut.uo_out.value) & 0x1:   # spikes[0]
+        if int(dut.uo_out.value) & 0x1:
             spike_seen = True
             break
 
@@ -110,13 +109,13 @@ async def test_ext_spike_injection(dut):
 async def test_weight_propagation(dut):
     """
     Repeated ext spike on neuron 0 must cause neuron 1 to spike via weight.
-    WEIGHTS[1][0] = 10, THRESHOLD = 40 → neuron 1 needs ~4 passes to spike.
+    WEIGHTS[1][0] = 10, THRESHOLD = 40 → neuron 1 needs ~11 passes to spike.
     """
     clock = Clock(dut.clk, 20, units="ns")
     cocotb.start_soon(clock.start())
     await do_reset(dut)
 
-    cocotb.start_soon(weight_driver(dut, WEIGHTS, ext_spike_mask=0b0001))
+    cocotb.start_soon(weight_driver(dut, WEIGHTS, ext_spike_mask=0b00000001))
 
     n1_spikes = 0
     for _ in range(FSM_PERIOD * 50):

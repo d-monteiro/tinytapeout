@@ -19,38 +19,41 @@ module tt_um_d_monteiro (
     // =========================================================
     // Parameters
     // =========================================================
-    localparam THRESHOLD = 6'd40;   // fire when vmem >= 40
-    localparam TRACE_MAX = 3'd7;    // trace saturates at 7
+    localparam THRESHOLD = 8'd40;   // fire when vmem >= 40
 
-    // FSM states — 7 per neuron, 4 neurons = 28 cycles per pass
-    localparam S_LATCH   = 3'd0;    // latch ext_spikes from RP2040
-    localparam S_TRACE   = 3'd1;    // decay / reset trace for this neuron
-    localparam S_ACCUM_0 = 3'd2;    // accumulate spike[0] * weight[n][0]
-    localparam S_ACCUM_1 = 3'd3;    // accumulate spike[1] * weight[n][1]
-    localparam S_ACCUM_2 = 3'd4;    // accumulate spike[2] * weight[n][2]
-    localparam S_ACCUM_3 = 3'd5;    // accumulate spike[3] * weight[n][3]
-    localparam S_THRESH  = 3'd6;    // apply threshold, emit spike
+    // FSM states — 11 per neuron, 8 neurons = 88 cycles per pass
+    localparam S_LATCH   = 4'd0;
+    localparam S_TRACE   = 4'd1;
+    localparam S_ACCUM_0 = 4'd2;
+    localparam S_ACCUM_1 = 4'd3;
+    localparam S_ACCUM_2 = 4'd4;
+    localparam S_ACCUM_3 = 4'd5;
+    localparam S_ACCUM_4 = 4'd6;
+    localparam S_ACCUM_5 = 4'd7;
+    localparam S_ACCUM_6 = 4'd8;
+    localparam S_ACCUM_7 = 4'd9;
+    localparam S_THRESH  = 4'd10;
 
     // =========================================================
     // State registers
     // =========================================================
-    reg [5:0] vmem  [0:3];   // membrane potential, 6-bit (0-63)
-    reg [2:0] trace [0:3];   // activity trace, 3-bit (0-7)
-    reg [3:0] spikes;        // spike outputs, one per neuron
-    reg [7:0] accum;         // weighted-sum accumulator for current neuron
-    reg [2:0] state;
-    reg [1:0] neuron_idx;
-    reg [3:0] ext_spikes;    // external spike injection, latched from ui_in[7:4]
+    reg [7:0] vmem  [0:7];   // membrane potential, 8-bit (0-255)
+    reg [2:0] trace [0:7];   // activity trace, 3-bit (0-7)
+    reg [7:0] spikes;        // spike outputs, one per neuron
+    reg [7:0] accum;         // weighted-sum accumulator
+    reg [3:0] state;         // 4-bit FSM state
+    reg [2:0] neuron_idx;    // 3-bit neuron index 0-7
+    reg [7:0] ext_spikes;    // external spike injection, full byte from ui_in
 
     // =========================================================
     // Derived signals
     // =========================================================
-    // in_accum: high during S_ACCUM_0..3 — tells RP2040 to present weight
-    wire in_accum = (state >= S_ACCUM_0) && (state <= S_ACCUM_3);
+    // in_accum: high during S_ACCUM_0..S_ACCUM_7 (states 2-9)
+    wire in_accum = (state >= S_ACCUM_0) && (state <= S_ACCUM_7);
 
-    // syn_idx: which pre-synaptic input we are accumulating (0-3)
-    // Maps S_ACCUM_0..3 (states 2-5) → syn_idx 0-3 via XOR
-    wire [1:0] syn_idx = state[1:0] ^ 2'b10;
+    // syn_idx: maps ACCUM states 2-9 → synapse indices 0-7
+    // 3-bit subtraction wraps correctly for states 8 (→6) and 9 (→7)
+    wire [2:0] syn_idx = state[2:0] - 3'd2;
 
     wire learn_ena = uio_in[0];
     wire _unused = &{uio_in[7:1], 1'b0};
@@ -60,12 +63,12 @@ module tt_um_d_monteiro (
     // =========================================================
     wire [7:0] accum_out;
     wire       spike_out;
-    wire [5:0] vmem_out;
+    wire [7:0] vmem_out;
 
     neuron_datapath datapath (
         .accum_in  (accum),
-        .weight    (ui_in[3:0]),        // RP2040 presents weight here during ACCUM
-        .pre_spike (spikes[syn_idx]),   // spike from pre-synaptic neuron
+        .weight    (ui_in[3:0]),
+        .pre_spike (spikes[syn_idx]),
         .accum_out (accum_out),
         .vmem_in   (vmem[neuron_idx]),
         .threshold (THRESHOLD),
@@ -76,21 +79,14 @@ module tt_um_d_monteiro (
     // =========================================================
     // Outputs
     // =========================================================
-    // ltp_pulse: fires when neuron spikes with learning enabled
-    // RP2040 watches this and increments weights where trace[i] > 0
-    wire ltp_pulse = learn_ena && spike_out && (state == S_THRESH);
+    assign uo_out[7:0] = spikes;        // all 8 spike outputs
 
-    assign uo_out[3:0] = spikes;       // spike outputs for all 4 neurons
-    assign uo_out[5:4] = neuron_idx;   // which neuron is active (for RP2040 sync)
-    assign uo_out[6]   = in_accum;     // high during ACCUM — RP2040 must present weight
-    assign uo_out[7]   = ltp_pulse;    // Hebbian learning trigger
+    assign uio_out[0]   = 1'b0;         // uio[0] is input direction
+    assign uio_out[1]   = in_accum;     // RP2040 weight-write gate
+    assign uio_out[4:2] = neuron_idx;   // which neuron is active
+    assign uio_out[7:5] = syn_idx;      // which synapse (valid when in_accum=1)
 
-    assign uio_out[3:0] = vmem[neuron_idx][5:2];  // top 4 bits of current vmem (debug)
-    assign uio_out[4]   = 1'b0;
-    assign uio_out[6:5] = syn_idx;     // which synapse (valid when in_accum=1)
-    assign uio_out[7]   = 1'b0;
-
-    assign uio_oe = 8'b1111_1110;      // uio[0] is input (learn_ena), rest outputs
+    assign uio_oe = 8'b1111_1110;       // uio[0] = learn_ena input, rest outputs
 
     // =========================================================
     // FSM
@@ -100,12 +96,12 @@ module tt_um_d_monteiro (
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state      <= S_LATCH;
-            neuron_idx <= 2'd0;
+            neuron_idx <= 3'd0;
             accum      <= 8'd0;
-            spikes     <= 4'd0;
-            ext_spikes <= 4'd0;
-            for (i = 0; i < 4; i = i + 1) begin
-                vmem[i]  <= 6'd0;
+            spikes     <= 8'd0;
+            ext_spikes <= 8'd0;
+            for (i = 0; i < 8; i = i + 1) begin
+                vmem[i]  <= 8'd0;
                 trace[i] <= 3'd0;
             end
 
@@ -113,34 +109,31 @@ module tt_um_d_monteiro (
             case (state)
 
                 S_LATCH: begin
-                    // Latch external spikes once per full pass (at neuron 0)
-                    if (neuron_idx == 2'd0)
-                        ext_spikes <= ui_in[7:4];
+                    // Latch all 8 external spikes from ui_in once per pass (neuron 0 only)
+                    if (neuron_idx == 3'd0)
+                        ext_spikes <= ui_in[7:0];
                     accum <= 8'd0;
                     state <= S_TRACE;
                 end
 
                 S_TRACE: begin
-                    // Update trace for this neuron only
                     if (spikes[neuron_idx])
-                        trace[neuron_idx] <= TRACE_MAX;
+                        trace[neuron_idx] <= 3'd7;
                     else if (trace[neuron_idx] > 0)
                         trace[neuron_idx] <= trace[neuron_idx] - 3'd1;
                     state <= S_ACCUM_0;
                 end
 
-                S_ACCUM_0, S_ACCUM_1, S_ACCUM_2, S_ACCUM_3: begin
-                    // RP2040 must have weight[neuron_idx][syn_idx] on ui_in[3:0]
+                S_ACCUM_0, S_ACCUM_1, S_ACCUM_2, S_ACCUM_3,
+                S_ACCUM_4, S_ACCUM_5, S_ACCUM_6, S_ACCUM_7: begin
                     accum <= accum_out;
-                    state <= state + 3'd1;
+                    state <= state + 4'd1;
                 end
 
                 S_THRESH: begin
-                    // OR in external spike injection alongside computed spike
                     spikes[neuron_idx] <= spike_out | ext_spikes[neuron_idx];
                     vmem[neuron_idx]   <= vmem_out;
-                    // Advance to next neuron
-                    neuron_idx <= (neuron_idx == 2'd3) ? 2'd0 : neuron_idx + 2'd1;
+                    neuron_idx <= (neuron_idx == 3'd7) ? 3'd0 : neuron_idx + 3'd1;
                     state      <= S_LATCH;
                 end
 
