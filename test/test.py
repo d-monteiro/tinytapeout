@@ -3,7 +3,7 @@
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, ClockCycles, Timer
+from cocotb.triggers import RisingEdge, FallingEdge, ClockCycles
 
 # =========================================================
 # Weight table: WEIGHTS[post_neuron][pre_neuron]
@@ -46,8 +46,7 @@ async def weight_driver(dut, weight_table, ext_spike_mask=0):
     ui_in[3:0] = weight[neuron][syn] when in_accum=1, else 0
     """
     while True:
-        await RisingEdge(dut.clk)
-        await Timer(1, units="ns")   # let combinatorial outputs settle
+        await FallingEdge(dut.clk)   # sample after NBA propagation, 10ns past rising edge
 
         in_accum = (int(dut.uo_out.value) >> 6) & 0x1
         neuron_n = (int(dut.uo_out.value) >> 4) & 0x3
